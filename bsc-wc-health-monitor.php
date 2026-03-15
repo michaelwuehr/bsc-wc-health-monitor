@@ -4,7 +4,7 @@
  * Description:  Überwacht WooCommerce-Shop-Gesundheit: Varnish-Cache, mu-Plugin-Status,
  *               blockierte Bestellanfragen, fällige Updates, ausstehende Kommentare
  *               und Bestellstatistiken. Meldet alles automatisch an den BSC Office Hub.
- * Version:      2.1.0
+ * Version:      2.2.0
  * Author:       Bavarian Soap Company / Woidsiederei
  * License:      GPL-2.0-or-later
  * Update URI:   https://github.com/michaelwuehr/bsc-wc-health-monitor
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // ─── Konstanten ───────────────────────────────────────────────────────────────
 
-define( 'BSCHWM_VERSION',          '2.1.0' );
+define( 'BSCHWM_VERSION',          '2.2.0' );
 define( 'BSCHWM_OPTION_SETTINGS',  'bschwm_settings' );
 define( 'BSCHWM_OPTION_CACHE',     'bschwm_last_cache' );
 define( 'BSCHWM_OPTION_BLOCKS',    'bschwm_last_blocks' );
@@ -701,6 +701,8 @@ add_filter( 'plugins_api', function ( $result, $action, $args ) {
 
     $release = bschwm_fetch_github_release();
 
+    $raw_base = 'https://raw.githubusercontent.com/' . BSCHWM_GITHUB_REPO . '/main/assets';
+
     return (object) [
         'name'          => 'BSC – Office Hub – WC Health Monitor',
         'slug'          => 'bsc-wc-health-monitor',
@@ -709,6 +711,14 @@ add_filter( 'plugins_api', function ( $result, $action, $args ) {
         'homepage'      => 'https://github.com/' . BSCHWM_GITHUB_REPO,
         'download_link' => $release ? $release->download_url : '',
         'last_updated'  => $release ? $release->published_at : '',
+        'icons'         => [
+            '1x'  => $raw_base . '/icon-128x128.png',
+            '2x'  => $raw_base . '/icon-256x256.png',
+        ],
+        'banners'       => [
+            'low'  => $raw_base . '/icon-256x256.png',
+            'high' => $raw_base . '/icon-256x256.png',
+        ],
         'sections'      => [
             'description' => 'WooCommerce Shop-Gesundheitsüberwachung: Varnish-Cache-Integrität, blockierte Bestellungen, fällige Updates, ausstehende Kommentare und Bestellstatistiken.',
             'changelog'   => $release && $release->changelog
@@ -746,6 +756,35 @@ register_activation_hook( __FILE__, function () {
 register_deactivation_hook( __FILE__, function () {
     wp_clear_scheduled_hook( BSCHWM_CRON_HOOK );
     wp_clear_scheduled_hook( BSCHWM_SINGLE_HOOK );
+} );
+
+// ─── Plugin-Icon in der WP Plugin-Liste ──────────────────────────────────────
+// WordPress zeigt Icons für Nicht-wp.org-Plugins nicht nativ an.
+// Wir injizieren das Icon per JS nur auf der Plugins-Seite.
+
+add_action( 'admin_footer', function () {
+    $screen = get_current_screen();
+    if ( ! $screen || $screen->id !== 'plugins' ) {
+        return;
+    }
+    $icon_url = 'https://raw.githubusercontent.com/' . BSCHWM_GITHUB_REPO . '/main/assets/icon-128x128.png';
+    ?>
+    <script>
+    (function () {
+        var row = document.querySelector('tr[data-plugin="bsc-wc-health-monitor/bsc-wc-health-monitor.php"]');
+        if (!row) return;
+        var strong = row.querySelector('.plugin-title strong');
+        if (!strong) return;
+        var img = document.createElement('img');
+        img.src = <?= json_encode( $icon_url ); ?>;
+        img.alt = '';
+        img.style.cssText = 'width:38px;height:38px;border-radius:6px;object-fit:cover;vertical-align:middle;margin-right:10px;flex-shrink:0;';
+        strong.style.display = 'flex';
+        strong.style.alignItems = 'center';
+        strong.insertBefore(img, strong.firstChild);
+    })();
+    </script>
+    <?php
 } );
 
 // ═══════════════════════════════════════════════════════════════════════════════
