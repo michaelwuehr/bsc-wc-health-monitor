@@ -4,7 +4,7 @@
  * Description:  Überwacht WooCommerce-Shop-Gesundheit: Varnish-Cache, mu-Plugin-Status,
  *               blockierte Bestellanfragen, fällige Updates, ausstehende Kommentare
  *               und Bestellstatistiken. Meldet alles automatisch an den BSC Office Hub.
- * Version:      2.0.0
+ * Version:      2.1.0
  * Author:       Bavarian Soap Company / Woidsiederei
  * License:      GPL-2.0-or-later
  * Update URI:   https://github.com/michaelwuehr/bsc-wc-health-monitor
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // ─── Konstanten ───────────────────────────────────────────────────────────────
 
-define( 'BSCHWM_VERSION',          '2.0.0' );
+define( 'BSCHWM_VERSION',          '2.1.0' );
 define( 'BSCHWM_OPTION_SETTINGS',  'bschwm_settings' );
 define( 'BSCHWM_OPTION_CACHE',     'bschwm_last_cache' );
 define( 'BSCHWM_OPTION_BLOCKS',    'bschwm_last_blocks' );
