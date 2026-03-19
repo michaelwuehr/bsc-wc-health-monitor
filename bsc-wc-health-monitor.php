@@ -4,7 +4,7 @@
  * Description:  Überwacht WooCommerce-Shop-Gesundheit: Varnish-Cache, mu-Plugin-Status,
  *               blockierte Bestellanfragen, fällige Updates, ausstehende Kommentare
  *               und Bestellstatistiken. Meldet alles automatisch an den BSC Office Hub.
- * Version:      2.4.0
+ * Version:      2.4.1
  * Author:       Bavarian Soap Company / Woidsiederei / Michael Wühr
  * License:      GPL-2.0-or-later
  * Requires at least: 6.0
@@ -18,7 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // ─── Konstanten ───────────────────────────────────────────────────────────────
 
-define( 'BSCHWM_VERSION',          '2.4.0' );
+define( 'BSCHWM_VERSION',          '2.4.1' );
 define( 'BSCHWM_OPTION_SETTINGS',  'bschwm_settings' );
 define( 'BSCHWM_OPTION_CACHE',     'bschwm_last_cache' );
 define( 'BSCHWM_OPTION_BLOCKS',    'bschwm_last_blocks' );
@@ -648,12 +648,17 @@ function bschwm_check_double_orders( int $window_minutes = 10 ): array {
     $orders = wc_get_orders( [
         'status'       => [ 'wc-processing', 'wc-completed', 'wc-on-hold' ],
         'date_created' => '>' . strtotime( '-24 hours' ),
-        'limit'        => -1,
+        'limit'        => 500, // Kein -1: verhindert Memory-Exhaustion bei großen Shops
         'return'       => 'objects',
+        'type'         => 'shop_order', // Explizit: keine Refunds (HPOS-Kompatibilität)
     ] );
     // Gruppieren nach billing_email + order_total
     $groups = [];
     foreach ( $orders as $order ) {
+        // HPOS kann auch OrderRefund-Objekte liefern – diese überspringen
+        if ( ! $order instanceof \WC_Order ) {
+            continue;
+        }
         $date_created = $order->get_date_created();
         if ( ! $date_created ) {
             continue; // Bestellung ohne Datum überspringen
