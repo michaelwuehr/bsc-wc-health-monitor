@@ -4,7 +4,7 @@
  * Description:  Überwacht WooCommerce-Shop-Gesundheit: Varnish-Cache, mu-Plugin-Status,
  *               blockierte Bestellanfragen, fällige Updates, ausstehende Kommentare
  *               und Bestellstatistiken. Meldet alles automatisch an den BSC Office Hub.
- * Version:      2.4.1
+ * Version:      2.4.2
  * Author:       Bavarian Soap Company / Woidsiederei / Michael Wühr
  * License:      GPL-2.0-or-later
  * Requires at least: 6.0
@@ -18,7 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // ─── Konstanten ───────────────────────────────────────────────────────────────
 
-define( 'BSCHWM_VERSION',          '2.4.1' );
+define( 'BSCHWM_VERSION',          '2.4.2' );
 define( 'BSCHWM_OPTION_SETTINGS',  'bschwm_settings' );
 define( 'BSCHWM_OPTION_CACHE',     'bschwm_last_cache' );
 define( 'BSCHWM_OPTION_BLOCKS',    'bschwm_last_blocks' );
@@ -63,10 +63,21 @@ function bschwm_reschedule_cron( string $interval ): void {
 
 function bschwm_default_settings(): array {
     return [
-        'site_url'      => get_site_url(),
-        'hub_url'       => '',
-        'hub_secret'    => '',
-        'cron_interval' => 'bschwm_1h',
+        'site_url'                       => get_site_url(),
+        'hub_url'                        => '',
+        'hub_secret'                     => '',
+        'cron_interval'                  => 'bschwm_1h',
+        // F-01: Cache-Checks optional
+        'check_session_fix'              => true,
+        'check_fb_fix'                   => true,
+        // F-02: MwSt.-Checks optional (kritische Checks immer aktiv)
+        'check_tax_prices_include_tax'   => true,
+        'check_tax_display_shop_incl'    => true,
+        'check_tax_display_cart_incl'    => true,
+        'check_tax_reduced_rate_7'       => true,
+        'check_tax_german_market_tax_ok' => true,
+        // F-02: SEPA optional
+        'check_sepa'                     => true,
     ];
 }
 
@@ -114,31 +125,36 @@ function bschwm_run_cache_check( string $trigger = 'manual' ): array {
     $checks   = [];
     $errors   = [];
     $warnings = [];
+    $settings = bschwm_get_settings();
 
-    // ── Check 1: fix-session-cache-limiter.php ────────────────────────────────
-    $session_fix_path = WPMU_PLUGIN_DIR . '/fix-session-cache-limiter.php';
-    $session_fix_ok   = false;
-    if ( file_exists( $session_fix_path ) ) {
-        $content        = file_get_contents( $session_fix_path );
-        $session_fix_ok = str_contains( $content, 'session.cache_limiter' )
-                       && str_contains( $content, 'session.use_cookies' );
-    }
-    $checks['session_fix'] = $session_fix_ok;
-    if ( ! $session_fix_ok ) {
-        $errors[] = 'fix-session-cache-limiter.php fehlt oder unvollständig — Cache-Control: no-store + Set-Cookie: PHPSESSID möglich!';
+    // ── Check 1: fix-session-cache-limiter.php (F-01: optional) ──────────────
+    if ( $settings['check_session_fix'] ?? true ) {
+        $session_fix_path = WPMU_PLUGIN_DIR . '/fix-session-cache-limiter.php';
+        $session_fix_ok   = false;
+        if ( file_exists( $session_fix_path ) ) {
+            $content        = file_get_contents( $session_fix_path );
+            $session_fix_ok = str_contains( $content, 'session.cache_limiter' )
+                           && str_contains( $content, 'session.use_cookies' );
+        }
+        $checks['session_fix'] = $session_fix_ok;
+        if ( ! $session_fix_ok ) {
+            $errors[] = 'fix-session-cache-limiter.php fehlt oder unvollständig — Cache-Control: no-store + Set-Cookie: PHPSESSID möglich!';
+        }
     }
 
-    // ── Check 2: fix-fb-no-setcookie.php ─────────────────────────────────────
-    $fb_fix_path = WPMU_PLUGIN_DIR . '/fix-fb-no-setcookie.php';
-    $fb_fix_ok   = false;
-    if ( file_exists( $fb_fix_path ) ) {
-        $content   = file_get_contents( $fb_fix_path );
-        $fb_fix_ok = str_contains( $content, 'param_builder_server_setup' )
-                  && str_contains( $content, 'facebook_for_woocommerce_integration_pixel_enabled' );
-    }
-    $checks['fb_fix'] = $fb_fix_ok;
-    if ( ! $fb_fix_ok ) {
-        $errors[] = 'fix-fb-no-setcookie.php fehlt oder unvollständig — Set-Cookie: _fbp möglich!';
+    // ── Check 2: fix-fb-no-setcookie.php (F-01: optional) ────────────────────
+    if ( $settings['check_fb_fix'] ?? true ) {
+        $fb_fix_path = WPMU_PLUGIN_DIR . '/fix-fb-no-setcookie.php';
+        $fb_fix_ok   = false;
+        if ( file_exists( $fb_fix_path ) ) {
+            $content   = file_get_contents( $fb_fix_path );
+            $fb_fix_ok = str_contains( $content, 'param_builder_server_setup' )
+                      && str_contains( $content, 'facebook_for_woocommerce_integration_pixel_enabled' );
+        }
+        $checks['fb_fix'] = $fb_fix_ok;
+        if ( ! $fb_fix_ok ) {
+            $errors[] = 'fix-fb-no-setcookie.php fehlt oder unvollständig — Set-Cookie: _fbp möglich!';
+        }
     }
 
     // ── Check 3: Facebook-Funktionsname noch vorhanden ────────────────────────
@@ -155,7 +171,6 @@ function bschwm_run_cache_check( string $trigger = 'manual' ): array {
     $checks['fb_function_present'] = $fb_fn_ok;
 
     // ── Check 4: Varnish Self-Check ───────────────────────────────────────────
-    $settings = bschwm_get_settings();
     $test_url = trailingslashit( $settings['site_url'] );
 
     $r1 = wp_remote_head( $test_url, [
@@ -217,8 +232,8 @@ function bschwm_run_cache_check( string $trigger = 'manual' ): array {
         $varnish_details           = [ 'http_error' => $errmsg ];
     }
 
-    $has_critical = ! $checks['session_fix']
-                 || ! $checks['fb_fix']
+    $has_critical = ( isset( $checks['session_fix'] ) && ! $checks['session_fix'] )
+                 || ( isset( $checks['fb_fix'] )      && ! $checks['fb_fix'] )
                  || ( $checks['varnish_caching'] === false );
 
     $status = 'ok';
@@ -606,10 +621,11 @@ function bschwm_check_cron(): array {
     $disabled = defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON;
     if ( $disabled ) {
         return [
-            'status'           => 'error',
-            'wp_cron_disabled' => true,
-            'next_run_delta_s' => null,
-            'alerts'           => [ 'WP-Cron ist deaktiviert (DISABLE_WP_CRON=true)' ],
+            'status'              => 'error',
+            'wp_cron_disabled'    => true,
+            'next_run_delta_s'    => null,
+            'last_cron_run_ago_s' => null,
+            'alerts'              => [ 'WP-Cron ist deaktiviert (DISABLE_WP_CRON=true)' ],
         ];
     }
     $next         = wp_next_scheduled( BSCHWM_CRON_HOOK );
@@ -625,18 +641,32 @@ function bschwm_check_cron(): array {
     $interval = $interval_map[ $settings['cron_interval'] ] ?? 3600;
     $status   = 'ok';
     $alerts   = [];
-    // $delta < 0: Cron ist überfällig; null: nicht eingeplant; > 2h: zu lange
+
+    // Geplanter Lauf: überfällig, nicht eingeplant oder zu weit in der Zukunft?
     if ( $delta === null || $delta < 0 || $delta > $interval * 2 ) {
         $status   = 'warning';
         $alerts[] = 'Nächster Cron-Lauf nicht planmäßig oder überfällig';
     }
-    // Hinweis: wird dieser Check während eines Cron-Laufs ausgeführt, kann $delta
-    // kurzzeitig null sein bevor WordPress neu einplant – bekannter False-Positive.
+
+    // F-03: Letzter echter Cron-Lauf (nur trigger='cron' setzt diesen Wert)
+    $last_cron_ts  = (int) get_option( 'bschwm_last_cron_run', 0 );
+    $last_cron_ago = $last_cron_ts > 0 ? ( time() - $last_cron_ts ) : null;
+    $max_age       = $interval * 2;
+
+    if ( $last_cron_ago === null ) {
+        $status   = 'warning';
+        $alerts[] = 'Noch kein echter Cron-Lauf aufgezeichnet – Server Cron prüfen!';
+    } elseif ( $last_cron_ago > $max_age ) {
+        $status   = 'warning';
+        $alerts[] = 'Letzter echter Cron-Lauf zu lange her (' . round( $last_cron_ago / 60 ) . ' Min.) – Server Cron prüfen!';
+    }
+
     return [
-        'status'           => $status,
-        'wp_cron_disabled' => false,
-        'next_run_delta_s' => $delta,
-        'alerts'           => $alerts,
+        'status'              => $status,
+        'wp_cron_disabled'    => false,
+        'next_run_delta_s'    => $delta,
+        'last_cron_run_ago_s' => $last_cron_ago,
+        'alerts'              => $alerts,
     ];
 }
 
@@ -717,7 +747,10 @@ function bschwm_check_german_market_tax(): bool {
 
 
 function bschwm_check_tax(): array {
-    $checks = [
+    $s = bschwm_get_settings();
+
+    // Alle möglichen Checks berechnen
+    $all_checks = [
         'tax_enabled'          => 'yes' === get_option( 'woocommerce_calc_taxes' ),
         'prices_include_tax'   => 'yes' === get_option( 'woocommerce_prices_include_tax' ),
         'display_shop_incl'    => 'incl' === get_option( 'woocommerce_tax_display_shop' ),
@@ -727,6 +760,24 @@ function bschwm_check_tax(): array {
         'german_market_active' => class_exists( 'WGM_Tax' ),
         'german_market_tax_ok' => bschwm_check_german_market_tax(),
     ];
+
+    // F-02: Deaktivierbare Checks (kritische Checks immer aktiv)
+    $optional = [
+        'prices_include_tax'   => 'check_tax_prices_include_tax',
+        'display_shop_incl'    => 'check_tax_display_shop_incl',
+        'display_cart_incl'    => 'check_tax_display_cart_incl',
+        'reduced_rate_7'       => 'check_tax_reduced_rate_7',
+        'german_market_tax_ok' => 'check_tax_german_market_tax_ok',
+    ];
+
+    $checks = [];
+    foreach ( $all_checks as $key => $val ) {
+        if ( isset( $optional[ $key ] ) && ! ( $s[ $optional[ $key ] ] ?? true ) ) {
+            continue; // F-02: Check deaktiviert → überspringen
+        }
+        $checks[ $key ] = $val;
+    }
+
     $alerts = [];
     foreach ( $checks as $k => $v ) {
         if ( ! $v ) {
@@ -777,6 +828,11 @@ function bschwm_check_sepa(): array {
 
 
 function bschwm_run_all_checks( string $trigger = 'manual' ): void {
+    // F-03: Letzten echten Cron-Lauf tracken (nur bei trigger='cron')
+    if ( $trigger === 'cron' ) {
+        update_option( 'bschwm_last_cron_run', time() );
+    }
+
     bschwm_run_cache_check( $trigger );
     bschwm_run_block_check( $trigger );
     bschwm_run_update_check( $trigger );
@@ -787,7 +843,12 @@ function bschwm_run_all_checks( string $trigger = 'manual' ): void {
     $cron_result   = bschwm_check_cron();
     $double_result = bschwm_check_double_orders();
     $tax_result    = bschwm_check_tax();
-    $sepa_result   = bschwm_check_sepa();
+
+    // F-02: SEPA-Check optional
+    $s           = bschwm_get_settings();
+    $sepa_result = ( $s['check_sepa'] ?? true )
+        ? bschwm_check_sepa()
+        : [ 'status' => 'ok', 'plugin' => 'deaktiviert', 'mandate_count' => 0, 'alerts' => [] ];
 
     // Worst-Status über alle Sub-Checks berechnen
     $status_order = [ 'ok' => 0, 'warning' => 1, 'error' => 2 ];
@@ -1058,10 +1119,21 @@ function bschwm_render_admin_page(): void {
             : 'bschwm_1h';
 
         update_option( BSCHWM_OPTION_SETTINGS, [
-            'site_url'      => esc_url_raw( trim( $_POST['site_url']    ?? '' ) ),
-            'hub_url'       => esc_url_raw( trim( $_POST['hub_url']     ?? '' ) ),
-            'hub_secret'    => sanitize_text_field( trim( $_POST['hub_secret'] ?? '' ) ),
-            'cron_interval' => $new_interval,
+            'site_url'                       => esc_url_raw( trim( $_POST['site_url']    ?? '' ) ),
+            'hub_url'                        => esc_url_raw( trim( $_POST['hub_url']     ?? '' ) ),
+            'hub_secret'                     => sanitize_text_field( trim( $_POST['hub_secret'] ?? '' ) ),
+            'cron_interval'                  => $new_interval,
+            // F-01: Cache-Checks (Checkbox = nur vorhanden wenn aktiv)
+            'check_session_fix'              => isset( $_POST['check_session_fix'] ),
+            'check_fb_fix'                   => isset( $_POST['check_fb_fix'] ),
+            // F-02: MwSt.-Checks
+            'check_tax_prices_include_tax'   => isset( $_POST['check_tax_prices_include_tax'] ),
+            'check_tax_display_shop_incl'    => isset( $_POST['check_tax_display_shop_incl'] ),
+            'check_tax_display_cart_incl'    => isset( $_POST['check_tax_display_cart_incl'] ),
+            'check_tax_reduced_rate_7'       => isset( $_POST['check_tax_reduced_rate_7'] ),
+            'check_tax_german_market_tax_ok' => isset( $_POST['check_tax_german_market_tax_ok'] ),
+            // F-02: SEPA
+            'check_sepa'                     => isset( $_POST['check_sepa'] ),
         ] );
         bschwm_reschedule_cron( $new_interval );
         echo '<div class="notice notice-success inline"><p>Einstellungen gespeichert.</p></div>';
@@ -1148,6 +1220,44 @@ function bschwm_render_admin_page(): void {
                     </td>
                 </tr>
             </table>
+
+            <h3 style="margin-top:24px">Optionale Checks (F-01 / F-02)</h3>
+            <p class="description" style="margin-bottom:12px">Deaktivierte Checks werden übersprungen und erzeugen weder Fehler noch Warnungen.</p>
+
+            <table class="form-table" role="presentation">
+                <tr>
+                    <th scope="row">Cache-Integrität</th>
+                    <td>
+                        <label><input type="checkbox" name="check_session_fix" value="1" <?= checked( $s['check_session_fix'] ?? true, true, false ); ?>>
+                            fix-session-cache-limiter.php prüfen</label><br>
+                        <label><input type="checkbox" name="check_fb_fix" value="1" <?= checked( $s['check_fb_fix'] ?? true, true, false ); ?>>
+                            fix-fb-no-setcookie.php prüfen</label>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row">MwSt.-Konfiguration</th>
+                    <td>
+                        <label><input type="checkbox" name="check_tax_prices_include_tax" value="1" <?= checked( $s['check_tax_prices_include_tax'] ?? true, true, false ); ?>>
+                            Bruttopreise (inkl. MwSt.) prüfen</label><br>
+                        <label><input type="checkbox" name="check_tax_display_shop_incl" value="1" <?= checked( $s['check_tax_display_shop_incl'] ?? true, true, false ); ?>>
+                            Shop-Preisanzeige inkl. MwSt. prüfen</label><br>
+                        <label><input type="checkbox" name="check_tax_display_cart_incl" value="1" <?= checked( $s['check_tax_display_cart_incl'] ?? true, true, false ); ?>>
+                            Warenkorb-Preisanzeige inkl. MwSt. prüfen</label><br>
+                        <label><input type="checkbox" name="check_tax_reduced_rate_7" value="1" <?= checked( $s['check_tax_reduced_rate_7'] ?? true, true, false ); ?>>
+                            Steuersatz 7% (ermäßigt) prüfen</label><br>
+                        <label><input type="checkbox" name="check_tax_german_market_tax_ok" value="1" <?= checked( $s['check_tax_german_market_tax_ok'] ?? true, true, false ); ?>>
+                            German Market Steuern prüfen</label>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row">SEPA-Mandate</th>
+                    <td>
+                        <label><input type="checkbox" name="check_sepa" value="1" <?= checked( $s['check_sepa'] ?? true, true, false ); ?>>
+                            SEPA-Mandate prüfen</label>
+                    </td>
+                </tr>
+            </table>
+
             <?php submit_button( 'Speichern' ); ?>
         </form>
     </div>
@@ -1367,8 +1477,15 @@ function bschwm_render_health( array $r ): string {
         } else {
             $delta_str = 'in ' . gmdate( 'H:i:s', $delta );
         }
+        $last_ago    = $cron['last_cron_run_ago_s'] ?? null;
+        $last_ago_str = $last_ago === null
+            ? '<span style="color:#d63638">noch nie aufgezeichnet</span>'
+            : 'vor ' . ( $last_ago < 3600 ? round( $last_ago / 60 ) . ' Min.' : round( $last_ago / 3600, 1 ) . ' Std.' );
+
         $rows .= "<tr><td style='width:40px;padding:8px;vertical-align:top'>{$icon}</td><td style='padding:8px'>"
-            . '<strong>WP-Cron</strong><br><small>Nächster geplanter Lauf: ' . $delta_str;
+            . '<strong>WP-Cron</strong><br><small>'
+            . 'Nächster geplanter Lauf: ' . $delta_str . '<br>'
+            . 'Letzter echter Cron-Lauf: ' . $last_ago_str;
         if ( ! empty( $cron['alerts'] ) ) {
             $rows .= '<br><span style="color:#996800">⚠ ' . esc_html( implode( ' | ', $cron['alerts'] ) ) . '</span>';
         }
