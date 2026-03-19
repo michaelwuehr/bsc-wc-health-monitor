@@ -4,9 +4,11 @@
  * Description:  Überwacht WooCommerce-Shop-Gesundheit: Varnish-Cache, mu-Plugin-Status,
  *               blockierte Bestellanfragen, fällige Updates, ausstehende Kommentare
  *               und Bestellstatistiken. Meldet alles automatisch an den BSC Office Hub.
- * Version:      2.2.0
- * Author:       Bavarian Soap Company / Woidsiederei
+ * Version:      2.4.0
+ * Author:       Bavarian Soap Company / Woidsiederei / Michael Wühr
  * License:      GPL-2.0-or-later
+ * Requires at least: 6.0
+ * Requires PHP:      8.0
  * Update URI:   https://github.com/michaelwuehr/bsc-wc-health-monitor
  */
 
@@ -16,13 +18,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // ─── Konstanten ───────────────────────────────────────────────────────────────
 
-define( 'BSCHWM_VERSION',          '2.2.0' );
+define( 'BSCHWM_VERSION',          '2.4.0' );
 define( 'BSCHWM_OPTION_SETTINGS',  'bschwm_settings' );
 define( 'BSCHWM_OPTION_CACHE',     'bschwm_last_cache' );
 define( 'BSCHWM_OPTION_BLOCKS',    'bschwm_last_blocks' );
 define( 'BSCHWM_OPTION_UPDATES',   'bschwm_last_updates' );
 define( 'BSCHWM_OPTION_COMMENTS',  'bschwm_last_comments' );
 define( 'BSCHWM_OPTION_ORDERS',    'bschwm_last_orders' );
+define( 'BSCHWM_OPTION_HEALTH',   'bschwm_last_health' );
 define( 'BSCHWM_OPTION_BLK_SNAP',  'bschwm_block_snapshot' );
 define( 'BSCHWM_CRON_HOOK',        'bschwm_scheduled_check' );
 define( 'BSCHWM_SINGLE_HOOK',      'bschwm_single_check' );
@@ -595,12 +598,215 @@ function bschwm_run_order_check( string $trigger = 'manual' ): array {
 
 // ─── Alle Module ausführen ────────────────────────────────────────────────────
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// HEALTH CHECKS v2.3.0
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function bschwm_check_cron(): array {
+    $disabled = defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON;
+    if ( $disabled ) {
+        return [
+            'status'           => 'error',
+            'wp_cron_disabled' => true,
+            'next_run_delta_s' => null,
+            'alerts'           => [ 'WP-Cron ist deaktiviert (DISABLE_WP_CRON=true)' ],
+        ];
+    }
+    $next         = wp_next_scheduled( BSCHWM_CRON_HOOK );
+    $delta        = $next ? ( $next - time() ) : null;
+    $settings     = bschwm_get_settings();
+    $interval_map = [
+        'bschwm_30min' => 1800,
+        'bschwm_1h'    => 3600,
+        'bschwm_2h'    => 7200,
+        'bschwm_6h'    => 21600,
+        'daily'        => 86400,
+    ];
+    $interval = $interval_map[ $settings['cron_interval'] ] ?? 3600;
+    $status   = 'ok';
+    $alerts   = [];
+    // $delta < 0: Cron ist überfällig; null: nicht eingeplant; > 2h: zu lange
+    if ( $delta === null || $delta < 0 || $delta > $interval * 2 ) {
+        $status   = 'warning';
+        $alerts[] = 'Nächster Cron-Lauf nicht planmäßig oder überfällig';
+    }
+    // Hinweis: wird dieser Check während eines Cron-Laufs ausgeführt, kann $delta
+    // kurzzeitig null sein bevor WordPress neu einplant – bekannter False-Positive.
+    return [
+        'status'           => $status,
+        'wp_cron_disabled' => false,
+        'next_run_delta_s' => $delta,
+        'alerts'           => $alerts,
+    ];
+}
+
+
+function bschwm_check_double_orders( int $window_minutes = 10 ): array {
+    if ( ! class_exists( 'WC_Order_Query' ) ) {
+        return [ 'status' => 'ok', 'count' => 0, 'window_minutes' => $window_minutes, 'examples' => [] ];
+    }
+    $orders = wc_get_orders( [
+        'status'       => [ 'wc-processing', 'wc-completed', 'wc-on-hold' ],
+        'date_created' => '>' . strtotime( '-24 hours' ),
+        'limit'        => -1,
+        'return'       => 'objects',
+    ] );
+    // Gruppieren nach billing_email + order_total
+    $groups = [];
+    foreach ( $orders as $order ) {
+        $date_created = $order->get_date_created();
+        if ( ! $date_created ) {
+            continue; // Bestellung ohne Datum überspringen
+        }
+        $key            = strtolower( $order->get_billing_email() ) . '|' . number_format( (float) $order->get_total(), 2 );
+        $groups[ $key ][] = $date_created->getTimestamp();
+    }
+    $duplicates = [];
+    foreach ( $groups as $key => $timestamps ) {
+        if ( count( $timestamps ) < 2 ) {
+            continue;
+        }
+        sort( $timestamps );
+        for ( $i = 1; $i < count( $timestamps ); $i++ ) {
+            if ( ( $timestamps[ $i ] - $timestamps[ $i - 1 ] ) < ( $window_minutes * 60 ) ) {
+                // E-Mail anonymisieren: user@example.com → u***@example.com
+                $key_parts = explode( '|', $key, 2 );
+                $email     = $key_parts[0] ?? '';
+                $amount    = $key_parts[1] ?? '0.00';
+                $parts     = explode( '@', $email );
+                $anon      = substr( $parts[0], 0, 1 ) . '***@' . ( $parts[1] ?? '' );
+                $duplicates[] = $anon . ' (€' . $amount . ')';
+                break;
+            }
+        }
+    }
+    $count = count( $duplicates );
+    return [
+        'status'         => $count > 0 ? 'warning' : 'ok',
+        'count'          => $count,
+        'window_minutes' => $window_minutes,
+        'examples'       => array_slice( $duplicates, 0, 5 ),
+    ];
+}
+
+
+function bschwm_has_tax_rate( float $rate, string $class ): bool {
+    global $wpdb;
+    $tax_class = ( $class === '' ) ? '' : $class;
+    // DECIMAL(10,4)-Spalte: Rundungstoleranz ±0.001 statt exakter Float-Vergleich
+    $count     = (int) $wpdb->get_var( $wpdb->prepare(
+        "SELECT COUNT(*) FROM {$wpdb->prefix}woocommerce_tax_rates WHERE ABS(tax_rate - %f) < 0.001 AND tax_rate_class = %s",
+        $rate,
+        $tax_class
+    ) );
+    return $count > 0;
+}
+
+
+function bschwm_check_german_market_tax(): bool {
+    if ( ! class_exists( 'WGM_Tax' ) ) {
+        return true; // Plugin nicht aktiv → Check irrelevant, kein Fehler
+    }
+    return method_exists( 'WGM_Tax', 'get_tax_rates' ) && ! empty( WGM_Tax::get_tax_rates() );
+}
+
+
+function bschwm_check_tax(): array {
+    $checks = [
+        'tax_enabled'          => 'yes' === get_option( 'woocommerce_calc_taxes' ),
+        'prices_include_tax'   => 'yes' === get_option( 'woocommerce_prices_include_tax' ),
+        'display_shop_incl'    => 'incl' === get_option( 'woocommerce_tax_display_shop' ),
+        'display_cart_incl'    => 'incl' === get_option( 'woocommerce_tax_display_cart' ),
+        'standard_rate_19'     => bschwm_has_tax_rate( 19.0, '' ),
+        'reduced_rate_7'       => bschwm_has_tax_rate( 7.0, 'reduced-rate' ),
+        'german_market_active' => class_exists( 'WGM_Tax' ),
+        'german_market_tax_ok' => bschwm_check_german_market_tax(),
+    ];
+    $alerts = [];
+    foreach ( $checks as $k => $v ) {
+        if ( ! $v ) {
+            $alerts[] = "Check fehlgeschlagen: {$k}";
+        }
+    }
+    return [
+        'status' => empty( $alerts ) ? 'ok' : ( count( $alerts ) > 2 ? 'error' : 'warning' ),
+        'alerts' => $alerts,
+        'checks' => $checks,
+    ];
+}
+
+
+function bschwm_check_sepa(): array {
+    global $wpdb;
+    $token_table = $wpdb->prefix . 'woocommerce_payment_tokens';
+
+    // WooPayments SEPA
+    $count = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$token_table} WHERE type = %s", 'sepa_debit' ) );
+    if ( $count > 0 ) {
+        return [ 'status' => 'ok', 'plugin' => 'woocommerce-payments', 'mandate_count' => $count, 'alerts' => [] ];
+    }
+
+    // Stripe WC SEPA
+    $count = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$token_table} WHERE type = %s", 'stripe_sepa' ) );
+    if ( $count > 0 ) {
+        return [ 'status' => 'ok', 'plugin' => 'woo-stripe-payment', 'mandate_count' => $count, 'alerts' => [] ];
+    }
+
+    // Mollie Mandate (eigene Tabelle)
+    $mollie_table = $wpdb->prefix . 'mollie_pending_payment';
+    $exists       = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $mollie_table ) );
+    if ( $exists === $mollie_table ) {
+        $count = (int) $wpdb->get_var( "SELECT COUNT(*) FROM `{$mollie_table}`" ); // phpcs:ignore -- Tabellenname aus $wpdb->prefix (trusted) + Konstante
+        if ( $count > 0 ) {
+            return [ 'status' => 'ok', 'plugin' => 'mollie', 'mandate_count' => $count, 'alerts' => [] ];
+        }
+    }
+
+    return [
+        'status'        => 'warning',
+        'plugin'        => 'none',
+        'mandate_count' => 0,
+        'alerts'        => [ 'Kein SEPA-Plugin gefunden oder keine Mandate' ],
+    ];
+}
+
+
 function bschwm_run_all_checks( string $trigger = 'manual' ): void {
     bschwm_run_cache_check( $trigger );
     bschwm_run_block_check( $trigger );
     bschwm_run_update_check( $trigger );
     bschwm_run_comment_check( $trigger );
     bschwm_run_order_check( $trigger );
+
+    // Health-Checks (v2.3.0)
+    $cron_result   = bschwm_check_cron();
+    $double_result = bschwm_check_double_orders();
+    $tax_result    = bschwm_check_tax();
+    $sepa_result   = bschwm_check_sepa();
+
+    // Worst-Status über alle Sub-Checks berechnen
+    $status_order = [ 'ok' => 0, 'warning' => 1, 'error' => 2 ];
+    $health_status = 'ok';
+    foreach ( [ $cron_result, $double_result, $tax_result, $sepa_result ] as $sub ) {
+        $sub_status = $sub['status'] ?? 'ok';
+        if ( ( $status_order[ $sub_status ] ?? 0 ) > ( $status_order[ $health_status ] ?? 0 ) ) {
+            $health_status = $sub_status;
+        }
+    }
+
+    $health_payload = [
+        'status'         => $health_status,
+        'source'         => parse_url( get_site_url(), PHP_URL_HOST ),
+        'trigger'        => $trigger,
+        'timestamp'      => gmdate( 'c' ),
+        'plugin_version' => BSCHWM_VERSION,
+        'cron'           => $cron_result,
+        'double_orders'  => $double_result,
+        'tax'            => $tax_result,
+        'sepa'           => $sepa_result,
+    ];
+    bschwm_push_to_hub( '/api/v1/monitoring/health', $health_payload );
+    update_option( BSCHWM_OPTION_HEALTH, $health_payload );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -707,7 +913,7 @@ add_filter( 'plugins_api', function ( $result, $action, $args ) {
         'name'          => 'BSC – Office Hub – WC Health Monitor',
         'slug'          => 'bsc-wc-health-monitor',
         'version'       => $release ? $release->version : BSCHWM_VERSION,
-        'author'        => 'Bavarian Soap Company / Woidsiederei',
+        'author'        => 'Bavarian Soap Company / Woidsiederei / Michael Wühr',
         'homepage'      => 'https://github.com/' . BSCHWM_GITHUB_REPO,
         'download_link' => $release ? $release->download_url : '',
         'last_updated'  => $release ? $release->published_at : '',
@@ -802,6 +1008,7 @@ add_action( 'admin_notices', function () {
         BSCHWM_OPTION_UPDATES  => [ 'icon' => '🔄', 'label' => 'Updates verfügbar' ],
         BSCHWM_OPTION_COMMENTS => [ 'icon' => '💬', 'label' => 'Kommentare' ],
         BSCHWM_OPTION_ORDERS   => [ 'icon' => '🛒', 'label' => 'Bestellungen' ],
+        BSCHWM_OPTION_HEALTH   => [ 'icon' => '❤️', 'label' => 'Health Checks' ],
     ];
 
     $url = admin_url( 'options-general.php?page=bsc-wc-health-monitor' );
@@ -865,6 +1072,7 @@ function bschwm_render_admin_page(): void {
     $updates  = get_option( BSCHWM_OPTION_UPDATES );
     $comments = get_option( BSCHWM_OPTION_COMMENTS );
     $orders   = get_option( BSCHWM_OPTION_ORDERS );
+    $health   = get_option( BSCHWM_OPTION_HEALTH );
     $s        = bschwm_get_settings();
     ?>
     <div class="wrap">
@@ -883,6 +1091,7 @@ function bschwm_render_admin_page(): void {
         bschwm_render_section( 'Fällige Updates',         $updates,  'bschwm_render_updates' );
         bschwm_render_section( 'Kommentare',              $comments, 'bschwm_render_comments' );
         bschwm_render_section( 'Bestellstatistiken',      $orders,   'bschwm_render_orders' );
+        bschwm_render_section( 'Health Checks',           $health,   'bschwm_render_health' );
         ?>
 
         <hr>
@@ -1129,6 +1338,104 @@ function bschwm_render_orders( array $r ): string {
         . "<td style='padding:8px;font-weight:bold'>Gesamt</td>"
         . "<td style='padding:8px;font-weight:bold'>" . (int) $r['total'] . "</td>"
         . "</tr>";
+
+    return bschwm_table( $rows );
+}
+
+// ─── Render: Health Checks ───────────────────────────────────────────────────
+
+function bschwm_render_health( array $r ): string {
+    $rows = '';
+
+    // ── WP-Cron ──────────────────────────────────────────────────────────────
+    $cron = $r['cron'] ?? null;
+    if ( $cron ) {
+        $icon      = bschwm_status_icon( $cron['status'] );
+        $delta     = $cron['next_run_delta_s'];
+        $disabled  = (bool) ( $cron['wp_cron_disabled'] ?? false );
+        if ( $disabled ) {
+            $delta_str = '<strong style="color:#d63638">DEAKTIVIERT (DISABLE_WP_CRON)</strong>';
+        } elseif ( $delta === null ) {
+            $delta_str = '<span style="color:#d63638">nicht eingeplant</span>';
+        } elseif ( $delta < 0 ) {
+            $delta_str = '<span style="color:#d63638">überfällig seit ' . gmdate( 'H:i:s', abs( $delta ) ) . '</span>';
+        } else {
+            $delta_str = 'in ' . gmdate( 'H:i:s', $delta );
+        }
+        $rows .= "<tr><td style='width:40px;padding:8px;vertical-align:top'>{$icon}</td><td style='padding:8px'>"
+            . '<strong>WP-Cron</strong><br><small>Nächster geplanter Lauf: ' . $delta_str;
+        if ( ! empty( $cron['alerts'] ) ) {
+            $rows .= '<br><span style="color:#996800">⚠ ' . esc_html( implode( ' | ', $cron['alerts'] ) ) . '</span>';
+        }
+        $rows .= '</small></td></tr>';
+    }
+
+    // ── Doppelte Bestellungen ─────────────────────────────────────────────────
+    $double = $r['double_orders'] ?? null;
+    if ( $double ) {
+        $icon  = bschwm_status_icon( $double['status'] );
+        $count = (int) $double['count'];
+        $cstr  = $count > 0
+            ? '<strong style="color:#996800">' . $count . ' Duplikat(e)</strong>'
+            : '<span style="color:#00a32a">keine</span>';
+        $rows .= "<tr><td style='width:40px;padding:8px;vertical-align:top'>{$icon}</td><td style='padding:8px'>"
+            . '<strong>Doppelte Bestellungen</strong> <small style="color:#555">(Fenster: ' . (int) $double['window_minutes'] . ' Min.)</small><br>'
+            . '<small>Gefunden: ' . $cstr;
+        if ( ! empty( $double['examples'] ) ) {
+            $rows .= ' <details style="display:inline-block;margin-left:8px"><summary style="cursor:pointer;color:#2271b1">Beispiele anzeigen</summary>'
+                . '<ul style="margin:4px 0 0 16px">';
+            foreach ( $double['examples'] as $ex ) {
+                $rows .= '<li><code>' . esc_html( $ex ) . '</code></li>';
+            }
+            $rows .= '</ul></details>';
+        }
+        $rows .= '</small></td></tr>';
+    }
+
+    // ── MwSt.-Konfiguration ───────────────────────────────────────────────────
+    $tax = $r['tax'] ?? null;
+    if ( $tax ) {
+        $icon         = bschwm_status_icon( $tax['status'] );
+        $check_labels = [
+            'tax_enabled'          => 'Steuerberechnung aktiv',
+            'prices_include_tax'   => 'Bruttopreise (inkl. MwSt.)',
+            'display_shop_incl'    => 'Shop-Preisanzeige: inkl. MwSt.',
+            'display_cart_incl'    => 'Warenkorb-Preisanzeige: inkl. MwSt.',
+            'standard_rate_19'     => 'Steuersatz 19% (Standard) vorhanden',
+            'reduced_rate_7'       => 'Steuersatz 7% (ermäßigt) vorhanden',
+            'german_market_active' => 'German Market Plugin aktiv',
+            'german_market_tax_ok' => 'German Market Steuern konfiguriert',
+        ];
+        $rows .= "<tr><td style='width:40px;padding:8px;vertical-align:top'>{$icon}</td><td style='padding:8px'>"
+            . '<strong>MwSt.-Konfiguration</strong><br>'
+            . '<table style="margin-top:6px;font-size:12px;border-collapse:collapse">';
+        foreach ( $tax['checks'] ?? [] as $key => $val ) {
+            $color = $val ? '#00a32a' : '#d63638';
+            $badge = $val ? 'OK' : 'FAIL';
+            $label = esc_html( $check_labels[ $key ] ?? $key );
+            $rows .= "<tr><td style='color:{$color};font-weight:bold;padding:2px 10px 2px 0;width:44px'>{$badge}</td>"
+                . "<td style='padding:2px 0'>{$label}</td></tr>";
+        }
+        $rows .= '</table></td></tr>';
+    }
+
+    // ── SEPA-Mandate ──────────────────────────────────────────────────────────
+    $sepa = $r['sepa'] ?? null;
+    if ( $sepa ) {
+        $icon     = bschwm_status_icon( $sepa['status'] );
+        $plugin   = esc_html( $sepa['plugin'] ?? 'none' );
+        $mandates = (int) ( $sepa['mandate_count'] ?? 0 );
+        $mstr     = $mandates > 0
+            ? '<span style="color:#00a32a"><strong>' . $mandates . '</strong></span>'
+            : '<span style="color:#996800"><strong>0</strong></span>';
+        $rows .= "<tr><td style='width:40px;padding:8px;vertical-align:top'>{$icon}</td><td style='padding:8px'>"
+            . '<strong>SEPA-Mandate</strong><br>'
+            . '<small>Gateway-Plugin: <code>' . $plugin . '</code> | Aktive Mandate: ' . $mstr;
+        if ( ! empty( $sepa['alerts'] ) ) {
+            $rows .= '<br><span style="color:#996800">⚠ ' . esc_html( implode( ' | ', $sepa['alerts'] ) ) . '</span>';
+        }
+        $rows .= '</small></td></tr>';
+    }
 
     return bschwm_table( $rows );
 }
