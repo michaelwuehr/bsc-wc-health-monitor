@@ -4,7 +4,7 @@
  * Description:  Überwacht WooCommerce-Shop-Gesundheit: Varnish-Cache, mu-Plugin-Status,
  *               blockierte Bestellanfragen, fällige Updates, ausstehende Kommentare
  *               und Bestellstatistiken. Meldet alles automatisch an den BSC Office Hub.
- * Version:      2.4.2
+ * Version:      2.5.0
  * Author:       Bavarian Soap Company / Woidsiederei / Michael Wühr
  * License:      GPL-2.0-or-later
  * Requires at least: 6.0
@@ -18,7 +18,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // ─── Konstanten ───────────────────────────────────────────────────────────────
 
-define( 'BSCHWM_VERSION',          '2.4.2' );
+define( 'BSCHWM_VERSION',          '2.5.0' );
+define( 'BSCHWM_SUCCESSOR_FILE',   'bsc-office-hub-integration/bsc-office-hub-integration.php' );
+define( 'BSCHWM_SUCCESSOR_ZIP',    'https://github.com/michaelwuehr/bsc-office-hub-integration/releases/latest/download/bsc-office-hub-integration.zip' );
 define( 'BSCHWM_OPTION_SETTINGS',  'bschwm_settings' );
 define( 'BSCHWM_OPTION_CACHE',     'bschwm_last_cache' );
 define( 'BSCHWM_OPTION_BLOCKS',    'bschwm_last_blocks' );
@@ -828,6 +830,11 @@ function bschwm_check_sepa(): array {
 
 
 function bschwm_run_all_checks( string $trigger = 'manual' ): void {
+    // DEPRECATED: Nachfolger-Plugin übernimmt das Monitoring – keine Doppel-Meldungen an den Hub
+    if ( bschwm_successor_active() ) {
+        return;
+    }
+
     // F-03: Letzten echten Cron-Lauf tracken (nur bei trigger='cron')
     if ( $trigger === 'cron' ) {
         update_option( 'bschwm_last_cron_run', time() );
@@ -1028,6 +1035,95 @@ register_activation_hook( __FILE__, function () {
 register_deactivation_hook( __FILE__, function () {
     wp_clear_scheduled_hook( BSCHWM_CRON_HOOK );
     wp_clear_scheduled_hook( BSCHWM_SINGLE_HOOK );
+} );
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEPRECATED – MIGRATION ZUM NACHFOLGER "BSC - Office Hub Integration"
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function bschwm_successor_active(): bool {
+    if ( defined( 'BSCHI_VERSION' ) ) {
+        return true;
+    }
+    if ( ! function_exists( 'is_plugin_active' ) ) {
+        require_once ABSPATH . 'wp-admin/includes/plugin.php';
+    }
+    return is_plugin_active( BSCHWM_SUCCESSOR_FILE );
+}
+
+add_action( 'admin_notices', function () {
+    if ( ! current_user_can( 'activate_plugins' ) ) {
+        return;
+    }
+
+    if ( bschwm_successor_active() ) {
+        $deactivate_url = wp_nonce_url(
+            admin_url( 'plugins.php?action=deactivate&plugin=' . rawurlencode( plugin_basename( __FILE__ ) ) ),
+            'deactivate-plugin_' . plugin_basename( __FILE__ )
+        );
+        printf(
+            '<div class="notice notice-warning"><p><strong>BSC WC Health Monitor ist veraltet.</strong> '
+            . 'Der Nachfolger "BSC - Office Hub Integration" ist bereits aktiv – dieses Plugin kann deaktiviert und gelöscht werden. '
+            . '<a href="%s" class="button">Jetzt deaktivieren</a></p></div>',
+            esc_url( $deactivate_url )
+        );
+        return;
+    }
+
+    if ( ! current_user_can( 'install_plugins' ) ) {
+        return;
+    }
+
+    $migrate_url = wp_nonce_url( admin_url( 'admin-post.php?action=bschwm_migrate' ), 'bschwm_migrate' );
+    $error       = isset( $_GET['bschwm_migrate_error'] ) ? sanitize_text_field( wp_unslash( $_GET['bschwm_migrate_error'] ) ) : '';
+
+    printf(
+        '<div class="notice notice-warning"><p><strong>BSC WC Health Monitor ist veraltet (DEPRECATED).</strong><br>'
+        . 'Der Nachfolger <strong>"BSC - Office Hub Integration"</strong> übernimmt das komplette Monitoring und bringt weitere Hub-Module mit '
+        . '(Sale-Banner, Doppelbestellungs-Erkennung v2, Kundendokumente, Preisliste, Chat). '
+        . 'Die Migration installiert das neue Plugin von GitHub, übernimmt alle Einstellungen automatisch und deaktiviert dieses Plugin.</p>'
+        . '%s'
+        . '<p><a href="%s" class="button button-primary">Jetzt zum neuen Plugin migrieren</a></p></div>',
+        $error ? '<p style="color:#d63638"><strong>Letzter Versuch fehlgeschlagen:</strong> ' . esc_html( $error ) . '</p>' : '',
+        esc_url( $migrate_url )
+    );
+} );
+
+add_action( 'admin_post_bschwm_migrate', function () {
+    if ( ! current_user_can( 'install_plugins' ) || ! check_admin_referer( 'bschwm_migrate' ) ) {
+        wp_die( 'Keine Berechtigung.' );
+    }
+
+    require_once ABSPATH . 'wp-admin/includes/file.php';
+    require_once ABSPATH . 'wp-admin/includes/misc.php';
+    require_once ABSPATH . 'wp-admin/includes/plugin.php';
+    require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+
+    $fail = function ( string $msg ): void {
+        wp_safe_redirect( admin_url( 'plugins.php?bschwm_migrate_error=' . rawurlencode( $msg ) ) );
+        exit;
+    };
+
+    // 1. Nachfolger installieren (falls noch nicht vorhanden)
+    if ( ! file_exists( WP_PLUGIN_DIR . '/' . BSCHWM_SUCCESSOR_FILE ) ) {
+        $upgrader = new Plugin_Upgrader( new Automatic_Upgrader_Skin() );
+        $result   = $upgrader->install( BSCHWM_SUCCESSOR_ZIP );
+        if ( is_wp_error( $result ) || ! $result ) {
+            $fail( is_wp_error( $result ) ? $result->get_error_message() : 'Download/Installation fehlgeschlagen.' );
+        }
+    }
+
+    // 2. Aktivieren (Activation-Hook des Nachfolgers übernimmt bschwm_settings automatisch)
+    $activated = activate_plugin( BSCHWM_SUCCESSOR_FILE );
+    if ( is_wp_error( $activated ) ) {
+        $fail( $activated->get_error_message() );
+    }
+
+    // 3. Sich selbst deaktivieren (Deactivation-Hook räumt die Crons auf)
+    deactivate_plugins( plugin_basename( __FILE__ ) );
+
+    wp_safe_redirect( admin_url( 'plugins.php?bschwm_migrated=1' ) );
+    exit;
 } );
 
 // ─── Plugin-Icon in der WP Plugin-Liste ──────────────────────────────────────
